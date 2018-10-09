@@ -1,0 +1,382 @@
+#!/bin/bash
+#
+# MIT License
+#
+# Copyright (c) 2018 Mirko Hoffmann
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+BASE_DIR="$HOME/.ssh-tunnel"
+SOCKET_DIR="$BASE_DIR/tunnel"
+INFO_DIR="$BASE_DIR/info"
+SAVE_DIR="$BASE_DIR/save"
+DEFAULT_LOCAL_PORT="4000"
+
+usage() {
+  cat <<EOF
+$(basename "$0"):   
+
+Usage: $(basename "$0") [<command> [<args>...]]
+
+Commands:
+  add <ssh host> [<local port>] <remote socket...>:
+    Create a tunnel to REMOTE SOCKETs via the SSH HOST
+
+    A comment may be appended to the REMOTE SOCKET separated by ':'
+
+    Example sockets:
+      - 127.0.0.1:8080
+      - 10.45.0.1:9980:trafik-content-4
+
+    If multiple REMOTE SOCKETs are defined, a tunnel will be created for
+    each socket. The LOCAL PORT will be incremented for each tunnel
+
+    By default the LOCAL PORT starts at 4000
+
+  list:
+    List all active ssh tunnel (default command)
+
+  kill <ssh host...>:
+    Kill the connection to SSH HOST, clearing all active tunnels
+
+  remove <local port...>:
+    Remove ssh tunnel of specified LOCAL PORTs
+
+  save <savefile> <local port...>
+    Save all given LOCAL PORTs to a SAVEFILE at '$SAVE_DIR'
+
+  load <savefile...>:
+    Load a SAVEFILE from '$SAVE_DIR'
+
+  help:
+    Print this message
+EOF
+}
+
+# Check if managed ssh sockets are still active for given host
+check_host_state() {
+  local SSH_HOST="$1"
+
+  if [[ -f "$INFO_DIR/$SSH_HOST" ]]; then
+    if ! [[ -S "$SOCKET_DIR/$SSH_HOST" ]]; then
+      echo "Stale data found for host '$SSH_HOST'... cleaning up"
+      kill_ssh_forward "$SSH_HOST"
+    elif ! ssh -S "$SOCKET_DIR/$SSH_HOST" -O check "$SSH_HOST" 2>/dev/null; then
+      echo "Connection to host '$SSH_HOST' exited... cleaning up"
+      kill_ssh_forward "$SSH_HOST"
+    fi
+  elif [[ -S "$SOCKET_DIR/$SSH_HOST" ]]; then
+    echo "Found connection to '$SSH_HOST' but no tunnel... cleaning up"
+    kill_ssh_forward "$SSH_HOST"
+  fi
+}
+
+# Print the info table for all given host-files
+print_info_table() {
+  if [[ $# -gt 0 ]]; then
+    column -t -s "\`" -o " | " --table-columns "PORT,REMOTE SOCKET,SSH HOST,LABEL" "$@"
+  fi
+}
+
+check_all_hosts() {
+  while IFS=  read -r -d $'\0' HOST_FILE; do
+    check_host_state "$(basename "$HOST_FILE")"
+  done < <(find "$INFO_DIR" -type f -print0)
+}
+
+# Print the info table for all managed hosts. Also check if they are still active
+list_all_hosts() {
+  local HOST_LIST=()
+
+  while IFS=  read -r -d $'\0' HOST_FILE; do
+    HOST_LIST+=("$HOST_FILE")
+  done < <(find "$INFO_DIR" -type f -print0)
+
+  print_info_table "${HOST_LIST[@]}"
+}
+
+# Kill a ssh connection to all given hosts, removing all managed remote sockets for each host
+kill_ssh_forward() {
+  for KILL_HOST in "$@"; do
+    HOST_FILE="$INFO_DIR/$KILL_HOST"
+    SOCKET_FILE="$SOCKET_DIR/$KILL_HOST"
+
+    if [[ -f "$HOST_FILE" ]] || [[ -S "$SOCKET_FILE" ]]; then
+      if [[ -S "$SOCKET_FILE" ]]; then
+        ssh -S "$SOCKET_FILE" -O exit "$KILL_HOST"
+      fi
+
+      rm "$HOST_FILE" "$SOCKET_FILE" 2>/dev/null
+    else
+      echo "Unable to find connection to '$KILL_HOST' to kill"
+    fi
+  done
+}
+
+# Create a ssh master socket if no active socket is found
+#  $1:    Remote ssh host
+ensure_ssh_socket() {
+  local SSH_HOST="$1"
+
+  if ! [[ -S "$SOCKET_DIR/$SSH_HOST" ]]; then
+    if ! ssh -M -S "$SOCKET_DIR/$SSH_HOST" -nNTf "$SSH_HOST"; then
+      echo "Unable to create ssh connection"
+      exit 1
+    fi
+  fi
+}
+
+# Add a tunnel to local cache for later establishing of tunnel
+#  $1:    Remote ssh host
+#  $2...: Remote sockets
+prepare_tunnel_add() {
+  echo "NaN"
+}
+
+# Ensure a ssh connection to given host and add tunnel to each given remote socket
+#  $1:    Remote ssh host
+#  $2:    <optional> local start port
+#  $3...: Remote sockets
+add_ssh_forward() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    echo ""
+    echo "Missing arguments for command 'add'"
+    exit 1
+  fi
+
+  local SSH_HOST="$1"
+  shift
+
+  LOCAL_PORT="${SSH_TUNNEL_LOCAL_PORT:-$DEFAULT_LOCAL_PORT}"
+
+  if [[ "$1" -gt 0 ]] 2>/dev/null; then
+    LOCAL_PORT="$1"
+    shift
+  fi
+
+  if [[ "$#" -eq 0 ]]; then
+    usage
+    echo ""
+    echo "Missing remote sockets for command 'add'"
+    exit 1
+  fi
+
+  check_host_state "$SSH_HOST"
+
+  ensure_ssh_socket "$SSH_HOST"
+
+  SSH_FORWARD_FLAG=()
+  SSH_FORWARD_INFO=()
+
+  for FORWARD_SOCKET in "$@"; do
+    while netstat -ntpl 2>/dev/null | grep -q "[0-9]:$LOCAL_PORT"; do
+      LOCAL_PORT=$((LOCAL_PORT+1))
+    done
+
+    SOCKET=$(echo "$FORWARD_SOCKET" | cut -d ":" -f 1,2)
+    LABEL=$(echo "$FORWARD_SOCKET" | cut -d ":" -f 3)
+
+    SSH_FORWARD_INFO+=("$LOCAL_PORT\`$SOCKET\`$SSH_HOST\`$LABEL")
+    SSH_FORWARD_FLAG+=("-L" "$LOCAL_PORT:$SOCKET")
+    
+    LOCAL_PORT=$((LOCAL_PORT+1))
+  done
+
+  if ! ssh -S "$SOCKET_DIR/$SSH_HOST" "${SSH_FORWARD_FLAG[@]}" -O forward "$SSH_HOST"; then
+    check_host_state "$SSH_HOST"
+    exit 1
+  fi
+
+  printf '%s\n' "${SSH_FORWARD_INFO[@]}" >> "$INFO_DIR/$SSH_HOST"
+
+  print_info_table "$INFO_DIR/$SSH_HOST"
+}
+
+# Remove ssh tunnel corresponding to each given local port
+remove_local_ports() {
+  for LOCAL_PORT in "$@"; do
+    local HOST_FILE SOCKET SSH_HOST
+
+    HOST_FILE=$(grep -r -l "^$LOCAL_PORT\`" "$INFO_DIR" 2>/dev/null)
+
+    if [[ -z "$HOST_FILE" ]]; then
+      echo "Unable to find tunnel mapped to local port '$LOCAL_PORT'"
+      continue
+    fi
+
+    SOCKET=$(grep "^$LOCAL_PORT\`" "$HOST_FILE" | cut -d '`' -f 2)
+    SSH_HOST=$(basename "$HOST_FILE")
+
+    ssh -S "$SOCKET_DIR/$SSH_HOST" -L "$LOCAL_PORT:$SOCKET" -O cancel "$SSH_HOST"
+    sed -i "/^$LOCAL_PORT\`/d" "$HOST_FILE"
+
+    if ! [[ -s $HOST_FILE ]]; then
+      echo "Removed last active connection for host '$SSH_HOST'. Killing connection..."
+      kill_ssh_forward "$SSH_HOST"
+    fi
+  done
+}
+
+# Load all given save files and create tunnels if possible
+#  $1...: Save files to load
+load_file() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    echo ""
+    echo "No savefile given to load!"
+    return
+  fi
+
+  for LOAD_FILE in "$@"; do
+    if [[ ! -f $SAVE_DIR/$LOAD_FILE ]]; then
+      echo "Unable to find $LOAD_FILE!"
+      continue
+    fi
+
+    while IFS=\` read -r LOCAL_PORT SOCKET SSH_HOST LABEL; do
+      SSH_FORWARD_INFO=()
+      SSH_FORWARD_FLAG=()
+
+      if netstat -ntpl 2>/dev/null | grep -q "[0-9]:$LOCAL_PORT"; then
+        echo "Unable to load '$LOAD_FILE', port '$LOCAL_PORT' already in use!"
+        continue
+      fi
+
+      ensure_ssh_socket "$SSH_HOST"
+
+      SSH_FORWARD_INFO+=("$LOCAL_PORT\`$SOCKET\`$SSH_HOST\`$LABEL")
+      SSH_FORWARD_FLAG+=("-L" "$LOCAL_PORT:$SOCKET")
+
+      if ! ssh -S "$SOCKET_DIR/$SSH_HOST" "${SSH_FORWARD_FLAG[@]}" -O forward "$SSH_HOST"; then
+        check_host_state "$SSH_HOST"
+        exit 1
+      fi
+
+      printf '%s\n' "${SSH_FORWARD_INFO[@]}" >> "$INFO_DIR/$SSH_HOST"
+    done < "$SAVE_DIR/$LOAD_FILE"
+  done
+
+  list_all_hosts
+}
+
+# Ask user if save file should be overwritten. Exit if no; return false on invalid answer.
+#  $1: Name of the save file
+save_ask_overwrite() {
+  read -rp "Save '$1' already exists. Overwrite existing save? [Y/n] " OVERWRITE
+
+  case "$OVERWRITE" in
+    "")
+      ;&
+    [yY])
+      echo "Overwriting..."
+      ;;
+    [nN])
+      echo "Aborting..."
+      exit 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Save all given local ports to a save file
+#  $1:    Name of the save file
+#  $2...: Local ports to save
+save_file() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    echo ""
+    echo "Missing arguments for command 'save'"
+    return
+  fi
+
+  SAVE_FILE="$SAVE_DIR/$1"
+  shift
+
+  if [[ $# -eq 0 ]]; then
+    usage
+    echo ""
+    echo "No local port given to save"
+    return
+  fi
+
+  SSH_FORWARD_INFO=()
+
+  if [[ -f "$SAVE_FILE" ]]; then
+    while ! save_ask_overwrite "${SAVE_FILE##*/}"; do
+      echo "Invalid answer"
+    done
+  fi
+
+  : > "$SAVE_FILE"
+
+  for LOCAL_PORT in "$@"; do
+    INFO=$(grep -rh "^$LOCAL_PORT\`" "$INFO_DIR")
+
+    if [[ -z $INFO ]]; then
+      echo "Unable to find tunnel mapped to local port '$LOCAL_PORT'"
+      continue
+    fi
+
+    echo "$INFO" >> "$SAVE_FILE"
+  done
+}
+
+# Setup
+[[ -d "$SOCKET_DIR" ]] || mkdir -p "$SOCKET_DIR" "$SAVE_DIR" "$INFO_DIR"
+
+COMMAND="$1"
+[[ -z $COMMAND ]] && COMMAND="list"
+shift
+
+# Check will already be done on "add"
+if [[ $COMMAND != "add" ]]; then
+  check_all_hosts
+fi
+
+case $COMMAND in
+  add)
+    add_ssh_forward "$@"
+    ;;
+  list)
+    list_all_hosts
+    ;;
+  kill)
+    kill_ssh_forward "$@"
+    ;;
+  remove)
+    remove_local_ports "$@"
+    ;;
+  load)
+    load_file "$@"
+    ;;
+  save)
+    save_file "$@"
+    ;;
+  help)
+    usage
+    ;;
+  *)
+    usage
+    echo ""
+    echo "Unknown command '$COMMAND'"
+    ;;
+esac
